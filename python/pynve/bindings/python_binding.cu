@@ -144,7 +144,10 @@ PYBIND11_MODULE(nve, m) {
         .def("accumulate", &NVEmbedBinding<IndexT>::accumulate, py::call_guard<py::gil_scoped_release>())
         .def("concat_backprop", &NVEmbedBinding<IndexT>::concat_backprop, py::call_guard<py::gil_scoped_release>())
         .def("pooling_backprop", &NVEmbedBinding<IndexT>::pooling_backprop, py::call_guard<py::gil_scoped_release>())
-        .def("update", &NVEmbedBinding<IndexT>::update, py::call_guard<py::gil_scoped_release>())
+        .def("update", static_cast<void (NVEmbedBinding<IndexT>::*)(
+                           size_t, uintptr_t, uintptr_t, uint64_t)>(
+                           &NVEmbedBinding<IndexT>::update),
+             py::call_guard<py::gil_scoped_release>())
         .def("insert", &NVEmbedBinding<IndexT>::insert, py::call_guard<py::gil_scoped_release>())
         .def("clear", &NVEmbedBinding<IndexT>::clear, py::call_guard<py::gil_scoped_release>())
         .def("erase", &NVEmbedBinding<IndexT>::erase, py::call_guard<py::gil_scoped_release>());

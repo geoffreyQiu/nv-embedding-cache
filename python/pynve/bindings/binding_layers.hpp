@@ -258,13 +258,19 @@ public:
 
     void update(size_t num_keys, uintptr_t keys, uintptr_t updates, uint64_t stream_)
     {
+        update(num_keys, keys, updates, -1, stream_);
+    }
+
+    void update(size_t num_keys, uintptr_t keys, uintptr_t updates,
+                int64_t table_id, uint64_t stream_)
+    {
         auto ctx = get_exec_context(reinterpret_cast<cudaStream_t>(stream_));
         emb_layer_ptr_->update(ctx, num_keys, 
                             reinterpret_cast<const void*>(keys),
                             row_size_in_bytes_,
                             row_size_in_bytes_,
                             reinterpret_cast<const void*>(updates),
-                            -1 /* affect all tables */);
+                            table_id);
     }
 
     void insert(size_t num_keys, uintptr_t keys, uintptr_t values, int64_t table_id, uint64_t stream_)
