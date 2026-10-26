@@ -22,6 +22,7 @@
 #include "include/thread_pool.hpp"
 
 #include <atomic>
+#include "host_row_copy.hpp"
 
 namespace nve {
 
@@ -35,7 +36,8 @@ int64_t cpu_kernel_gather(thread_pool_ptr_t thread_pool,
               int8_t* uvm_table_ptr,
               size_t row_size_in_bytes,
               uint64_t num_rows,
-              uint64_t num_threads)
+              uint64_t num_threads,
+              bool concurrent_host_updates = false)
 {
     constexpr uint64_t num_bits_in_hit_mask = sizeof(bitmask64_t) * 8;
     auto keys_per_task{ceil_div(n, num_threads)};
@@ -65,7 +67,11 @@ int64_t cpu_kernel_gather(thread_pool_ptr_t thread_pool,
             }
             int8_t* src_ptr = uvm_table_ptr + (static_cast<size_t>(key) * row_size_in_bytes);
             int8_t* dst_ptr = reinterpret_cast<int8_t*>(values) + (base_key + i) * value_stride;
-            std::memcpy(dst_ptr, src_ptr, row_size_in_bytes);
+            if (concurrent_host_updates) {
+                copy_host_row<false>(dst_ptr, src_ptr, row_size_in_bytes);
+            } else {
+                std::memcpy(dst_ptr, src_ptr, row_size_in_bytes);
+            }
             ++task_hits;
             if (hit_mask != nullptr) {
                 // No synchronization needed, mask words are partitioned between tasks (see above).

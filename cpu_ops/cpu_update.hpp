@@ -21,6 +21,7 @@
 #include "include/common.hpp"
 #include "include/thread_pool.hpp"
 #include "include/nve_types.hpp"
+#include "host_row_copy.hpp"
 
 namespace nve {
 
@@ -33,7 +34,8 @@ int cpu_kernel_update(thread_pool_ptr_t thread_pool,
                       int8_t* uvm_table_ptr,
                       size_t row_size_in_bytes,
                       uint64_t num_rows,
-                      uint64_t num_threads)
+                      uint64_t num_threads,
+                      bool concurrent_host_updates = false)
 {
   auto keys_per_task = ceil_div(n, num_threads);
 
@@ -50,7 +52,11 @@ int cpu_kernel_update(thread_pool_ptr_t thread_pool,
       }
       int8_t* dst_ptr = uvm_table_ptr + (static_cast<size_t>(key) * row_size_in_bytes);
       const int8_t* src_ptr = reinterpret_cast<const int8_t*>(values) + (base_key + i) * value_stride;
-      memcpy(dst_ptr, src_ptr, row_size_in_bytes);
+      if (concurrent_host_updates) {
+        copy_host_row<true>(const_cast<int8_t*>(src_ptr), dst_ptr, row_size_in_bytes);
+      } else {
+        memcpy(dst_ptr, src_ptr, row_size_in_bytes);
+      }
     }
   };
 

@@ -147,6 +147,14 @@ embedding = nve_layers.NVEmbedding(
 **Constraints:**
 - `optimize_for_training=False` is required; HostLayer does not support gradient computation.
 - Both `NVEmbedding` and `NVEmbeddingBag` support `HostLayer`; pooled lookups (`sum`/`mean`, optionally weighted via `per_sample_weights`) run on CPU threads.
+- CPU lookup may run concurrently with `update` on the same fixed dense storage.
+  Row access uses relaxed, lock-free atomic words: a lookup may observe stale or
+  mixed values, including within a row. After an update returns, subsequent
+  lookups observe the new values. This is not a row or batch transaction. Use a
+  single update writer; keep the storage allocation fixed. Raw tensor writes,
+  accumulation and serialization require quiescent readers. CPU torch lookup
+  contexts are already separate per thread; low-level callers must likewise use
+  separate execution contexts for concurrent operations.
 - If providing a custom `storage` memblock, it must be host-accessible: `HostMemBlock`, `ManagedMemBlock`, a `UserMemBlock` wrapping a pinned tensor, or a host-side `LinearMemBlock` (device_id=-1). `NVL` and `MPI` memblocks are rejected.
 - Keys outside the table return the `default_embedding` config value — zeros unless configured (torch.nn.Embedding raises instead).
 

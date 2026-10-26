@@ -102,7 +102,8 @@ public:
       static_cast<int8_t*>(config_.emb_table),
       static_cast<uint64_t>(config_.max_value_size),
       static_cast<uint64_t>(config_.num_rows),
-      static_cast<uint64_t>(num_threads)
+      static_cast<uint64_t>(num_threads),
+      true /* concurrent_host_updates: relaxed word access */
     );
     auto ctx_counter = lookup_counter_storage(ctx);
     NVE_CHECK_(ctx_counter != nullptr, "Invalid key counter");
@@ -139,7 +140,8 @@ public:
       static_cast<int8_t*>(config_.emb_table),
       static_cast<uint64_t>(config_.max_value_size),
       static_cast<uint64_t>(config_.num_rows),
-      static_cast<uint64_t>(num_threads)
+      static_cast<uint64_t>(num_threads),
+      true /* concurrent_host_updates: relaxed word access */
     ) == 0);
   }
 
