@@ -86,6 +86,21 @@ Hit rates are the fraction of all requested keys resolved by each tier (they sum
 The CSV holds the run parameters, `mkps`/`gbps`, `<tier>_hitrate_mean/min/max/samples`, `lat_*` percentiles and
 the setup, prefill and file creation times.
 
+## HostLayer CPU Inference Benchmark
+
+`host_layer_bench` measures the CPU-only `HostEmbeddingLayer` lookup path, with
+power-law/uniform keys, concurrent callers, configurable NVE workers, throughput,
+latency percentiles and CSV output. It is independent of PyTorch and needs no GPU.
+
+```bash
+bash benchmarks/host_layer/build.sh
+./build-host-layer/bin/host_layer_bench --alpha 1.05 --threads 1 --disable_threadpool
+```
+
+A Docker build/run workflow starts from `nvcr.io/nvidia/pytorch:26.03-py3`.
+See [HostLayer benchmark](host_layer_benchmark.md) for build flags, thread controls,
+measurement boundaries, tests, NUMA guidance and memory requirements.
+
 ## Multi GPU Benchmark
 
 This benchmark measures the performance of a single embedding table sharded on multiple GPUs. Performance metrics will be printed per GPU.  

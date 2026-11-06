@@ -20,6 +20,7 @@ forms unless noted otherwise below.
 |---|---|---|
 | `NVE_DRIVERLESS_BUILD` | `OFF` | Builds without the CUDA driver API or `libcuda`. Driver-dependent functionality is compiled as unsupported stubs. A direct CMake build must set an appropriate `NVE_SM_VERSION` separately. |
 | `NVE_DISABLE_TESTS_AND_SAMPLES` | `OFF` | Set to `ON` to exclude all tests and samples from the build. |
+| `NVE_BUILD_HOST_BENCHMARK` | `OFF` | Builds `host_layer_bench` even when tests/samples are excluded. Normal builds already include it. |
 | `NVE_ORIGIN_RPATH` | `OFF` | Sets the install RPATH to `$ORIGIN` and the build library directory so relocated shared libraries can find local dependencies. |
 
 ## Python package builds

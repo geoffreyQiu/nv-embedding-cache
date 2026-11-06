@@ -17,3 +17,5 @@ include_directories(${PROJECT_SOURCE_DIR}/third_party/argparse/include)
 
 add_executable(single_layer_bench single_layer_bench.cpp)
 target_link_libraries(single_layer_bench PUBLIC nve-common)
+
+add_subdirectory(host_layer)
