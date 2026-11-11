@@ -3,7 +3,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Runner tests without CUDA, a benchmark build, or a specific host topology."""
 import csv
+import contextlib
 import importlib.util
+import io
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -87,6 +90,122 @@ class PreflightTests(unittest.TestCase):
     def test_failed_process(self):
         with self.assertRaisesRegex(SystemExit, "preflight failed"):
             self.run_probe("current", returncode=1)
+
+
+class SocketTuningTests(unittest.TestCase):
+    @staticmethod
+    def topology(cores):
+        return [(socket * cores + core + sibling * cores * 2, core, socket, socket)
+                for socket in range(2) for core in range(cores) for sibling in range(2)]
+
+    def cases(self, cores):
+        rows = self.topology(cores)
+        return RUNNER.make_socket_tuning_cases(rows, {r[0] for r in rows}, {0, 1})
+
+    def test_both_turin_sizes_use_full_pool_and_one_thread_per_core(self):
+        for cores in (128, 192):
+            with self.subTest(cores=cores):
+                cases = self.cases(cores)
+                self.assertEqual(len(cases), 4)
+                for callers in (1, 2, 4):
+                    case = cases[f"socket0-c{callers}-full-pool"]
+                    self.assertEqual((case["mode"], case["callers"], case["workers"]),
+                                     ("pool", callers, cores))
+                    self.assertEqual(case["cpus"], list(range(cores)))
+                    self.assertEqual((case["nodes"], case["memory_policy"]), ([0], "membind"))
+                inline = cases["socket0-c64-inline"]
+                self.assertEqual((inline["mode"], inline["callers"], inline["workers"]),
+                                 ("inline", 64, 0))
+                self.assertEqual(len(set(inline["cpus"])), 64)
+                self.assertEqual(inline["cpus"][0], 0)
+                self.assertEqual(inline["cpus"][-1], cores - 1)
+                self.assertTrue(set(inline["cpus"]) <= set(range(cores)))
+
+    def test_allowed_smt_siblings_can_represent_physical_cores(self):
+        rows = self.topology(128)
+        cases = RUNNER.make_socket_tuning_cases(rows, set(range(256, 512)), {0, 1})
+        self.assertEqual(cases["socket0-c1-full-pool"]["cpus"], list(range(256, 384)))
+        self.assertEqual(len(cases["socket0-c64-inline"]["cpus"]), 64)
+
+    def test_small_socket_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "at least 64"):
+            self.cases(32)
+
+    def test_profile_rejects_smt(self):
+        with patch("sys.argv", ["runner", "--profile", "socket-tuning", "--smt"]), \
+             contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+            RUNNER.main()
+        self.assertEqual(error.exception.code, 2)
+
+    def test_mixed_profile_runs_and_summarizes_all_four_cases(self):
+        cases = self.cases(128)
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            inline = "--disable_threadpool" in cmd
+            callers = int(cmd[cmd.index("--threads") + 1])
+            if inline:
+                self.assertEqual(callers, 64)
+                self.assertNotIn("--threadpool_workers", cmd)
+                workers = 1  # NVE InlineThreadPool reports one worker.
+            else:
+                self.assertIn(callers, (1, 2, 4))
+                workers = int(cmd[cmd.index("--threadpool_workers") + 1])
+                self.assertEqual(workers, 128)
+            self.assertEqual(kwargs["env"]["CUDA_VISIBLE_DEVICES"], "-1")
+            row = dict(nve_revision="current", verification="passed", threads=callers,
+                       disable_threadpool=int(inline), threadpool_workers_effective=workers,
+                       **{field: 1.25 for field in RUNNER.FIELDS})
+            path = Path(cmd[cmd.index("--csv_filename") + 1])
+            exists = path.exists()
+            with path.open("a", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=list(row))
+                if not exists:
+                    writer.writeheader()
+                writer.writerow(row)
+            return subprocess.CompletedProcess(cmd, 0)
+
+        def fake_command(cmd):
+            if cmd[0] == "git":
+                return "current"
+            if cmd[:2] == ["lscpu", "--online"]:
+                return "\n".join(",".join(map(str, row)) for row in self.topology(128))
+            return "fixture"
+
+        def fake_read(path):
+            if str(path) == "/proc/self/status":
+                return "Mems_allowed_list:\t0-1"
+            if str(path).endswith("/meminfo"):
+                return "MemTotal: 1000000 kB"
+            return "unavailable"
+
+        previous = Path.cwd()
+        with tempfile.TemporaryDirectory() as directory:
+            try:
+                os.chdir(directory)
+                binary = Path("build-host-layer/bin/host_layer_bench")
+                binary.parent.mkdir(parents=True)
+                binary.touch()
+                with patch("sys.argv", ["runner", "--profile", "socket-tuning"]), \
+                     patch.object(RUNNER, "command", side_effect=fake_command), \
+                     patch.object(RUNNER, "read", side_effect=fake_read), \
+                     patch.object(RUNNER, "make_socket_tuning_cases", return_value=cases), \
+                     patch.object(RUNNER, "verify_binary") as preflight, \
+                     patch.object(RUNNER.subprocess, "run", side_effect=fake_run), \
+                     contextlib.redirect_stdout(io.StringIO()) as output:
+                    RUNNER.main()
+                preflight.assert_called_once()
+                self.assertEqual(len(calls), 20)
+                summary = next(Path("build-host-layer/results").glob("*/summary.csv"))
+                with summary.open(newline="") as f:
+                    rows = list(csv.DictReader(f))
+                self.assertEqual([r["mode"] for r in rows], ["pool", "pool", "pool", "inline"])
+                self.assertEqual([r["runs"] for r in rows], ["5"] * 4)
+                self.assertTrue((summary.parent / "results-for-chat.txt").is_file())
+                self.assertNotIn("Later round reminder", output.getvalue())
+            finally:
+                os.chdir(previous)
 
 
 if __name__ == "__main__":

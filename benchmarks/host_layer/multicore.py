@@ -91,8 +91,45 @@ def make_cases(rows, allowed, memory_nodes, smt, mode):
     return cases
 
 
+def make_socket_tuning_cases(rows, allowed, memory_nodes):
+    """Few callers with a full socket pool, plus a 64-core inline comparison."""
+    baseline = make_cases(rows, allowed, memory_nodes, False, "pool")
+    name, socket = next((name, case) for name, case in baseline.items()
+                        if name.startswith("socket"))
+    prefix = name.removesuffix("-cores")
+    cpus = socket["cpus"]
+    if len(cpus) < 64:
+        raise ValueError("Socket tuning requires at least 64 accessible physical cores in the first socket.")
+    cases = {
+        f"{prefix}-c{callers}-full-pool": dict(socket, mode="pool", callers=callers)
+        for callers in (1, 2, 4)
+    }
+    # Spread the 64 choices across the sorted CPU list instead of taking a prefix.
+    # This is a CPU-set restriction, not permanent per-thread pinning.
+    selected = [cpus[i * (len(cpus) - 1) // 63] for i in range(64)]
+    nodes = sorted({r[3] for r in rows if r[0] in selected})
+    cases[f"{prefix}-c64-inline"] = dict(
+        cpus=selected, nodes=nodes,
+        memory_policy="membind" if len(nodes) == 1 else "interleave",
+        callers=64, workers=0, mode="inline")
+    return cases
+
+
+def benchmark_command(binary, common, case, mode, label, repeat, out):
+    bind = [f"--physcpubind={','.join(map(str, case['cpus']))}",
+            f"--{case['memory_policy']}={','.join(map(str, case['nodes']))}"]
+    threads = ["--threads", str(case["callers"])]
+    threads += (["--disable_threadpool"] if mode == "inline" else
+                ["--threadpool_workers", str(case["workers"])])
+    return ["numactl", *bind, str(binary), *common, *threads,
+            "--tag", f"{mode}-{label}-r{repeat}",
+            "--csv_filename", str(out / f"{label}.csv")]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--profile", choices=["baseline", "socket-tuning"], default="baseline",
+                        help="socket-tuning: 1/2/4 callers with a full socket pool; 64 callers inline")
     parser.add_argument("--mode", choices=["inline", "pool"], default="inline")
     parser.add_argument("--smt", action="store_true", help="also test all hardware threads")
     parser.add_argument("--repeats", type=int, default=5)
@@ -100,6 +137,8 @@ def main():
     args = parser.parse_args()
     if args.repeats < 1:
         parser.error("--repeats must be positive")
+    if args.profile == "socket-tuning" and (args.mode != "inline" or args.smt):
+        parser.error("socket-tuning defines its own pool/inline cases and uses one hardware thread per core; omit --mode and --smt")
     revision = command(["git", "rev-parse", "HEAD"])
     binary = Path("build-host-layer/bin/host_layer_bench").resolve()
     if not binary.is_file():
@@ -115,12 +154,17 @@ def main():
         node_id = int(node.name[4:])
         if match and int(match[1]) > 0 and node_id in mem_allowed:
             memory_nodes.add(node_id)
-    cases = make_cases(rows, os.sched_getaffinity(0), memory_nodes, args.smt, args.mode)
+    if args.profile == "socket-tuning":
+        cases = make_socket_tuning_cases(rows, os.sched_getaffinity(0), memory_nodes)
+    else:
+        cases = make_cases(rows, os.sched_getaffinity(0), memory_nodes, args.smt, args.mode)
+    mode_label = "socket-tuning" if args.profile == "socket-tuning" else args.mode
     root = Path("build-host-layer/results")
     root.mkdir(parents=True, exist_ok=True)
-    out = Path(tempfile.mkdtemp(prefix=f"multicore-{args.mode}-", dir=root)).resolve()
+    out = Path(tempfile.mkdtemp(prefix=f"multicore-{mode_label}-", dir=root)).resolve()
     (out / "plan.json").write_text(json.dumps(dict(server=platform.node(),
-        revision=revision, mode=args.mode, repeats=args.repeats, cases=cases), indent=2) + "\n")
+        revision=revision, mode=mode_label, profile=args.profile,
+        repeats=args.repeats, cases=cases), indent=2) + "\n")
     (out / "topology.csv").write_text(topology + "\n")
     env = [f"Server: {platform.node()}", f"Kernel: {platform.release()}",
            f"Container OS: {platform.freedesktop_os_release().get('PRETTY_NAME')}",
@@ -148,14 +192,22 @@ def main():
               ("cpu.max", "memory.max", "memory.current", "pids.max", "pids.current")]
     env += [f"{p}: {read(p)}" for p in paths]
     (out / "environment.txt").write_text("\n".join(env) + "\n")
-    print("Server:", platform.node(), "| Mode:", args.mode, flush=True)
+    print("Server:", platform.node(), "| Mode:", mode_label, flush=True)
+    if args.profile == "socket-tuning":
+        print("Kernel:", platform.release(), "| Base page size:", os.sysconf("SC_PAGE_SIZE"))
+        print("Source:", revision)
     print("THP policy:", read(thp / "enabled"))
     print("Results directory:", out)
     for name, case in cases.items():
         gib = (512000000 + case["callers"] * (134217728 + 8388608)) / 2**30
         print(f"{name}: {case['callers']} callers, {case['workers']} NVE workers; "
+              f"{len(case['cpus'])} selected logical CPUs; "
               f"{case['memory_policy']}={case['nodes']}; main buffers {gib:.2f} GiB")
-    print("Later round reminder: compare THP madvise -> always; verify actual THP usage.", flush=True)
+    if args.profile == "socket-tuning":
+        print("SMT unused: one hardware thread per selected physical core.")
+        print("Task threshold 1024: at most 16 gather tasks per lookup; a full pool does not imply full utilization.", flush=True)
+    else:
+        print("Later round reminder: compare THP madvise -> always; verify actual THP usage.", flush=True)
     if args.plan_only:
         return
     # Check visible cgroup limits before starting a potentially large run.
@@ -181,15 +233,9 @@ def main():
         rng.shuffle(order)
         for name in order:
             c = cases[name]
+            mode = c.get("mode", args.mode)
             print(f"Round {repeat}/{args.repeats}: {name}", flush=True)
-            bind = [f"--physcpubind={','.join(map(str, c['cpus']))}",
-                    f"--{c['memory_policy']}={','.join(map(str, c['nodes']))}"]
-            threads = ["--threads", str(c["callers"])]
-            threads += (["--disable_threadpool"] if args.mode == "inline" else
-                        ["--threadpool_workers", str(c["workers"])])
-            cmd = ["numactl", *bind, str(binary), *common, *threads,
-                   "--tag", f"{args.mode}-{name}-r{repeat}",
-                   "--csv_filename", str(out / f"{name}.csv")]
+            cmd = benchmark_command(binary, common, c, mode, name, repeat, out)
             log_path = out / f"{name}-r{repeat}.log"
             with log_path.open("w") as log:
                 log.write(shlex.join(cmd) + "\n")
@@ -199,14 +245,21 @@ def main():
             if result.returncode:
                 raise SystemExit(f"Benchmark failed; see {log_path}")
     summary = []
+    per_run = []
     for name, case in cases.items():
+        mode = case.get("mode", args.mode)
         with (out / f"{name}.csv").open(newline="") as f:
             records = list(csv.DictReader(f))
         if len(records) != args.repeats or any(
-            r["verification"] != "passed" or r["nve_revision"] != revision for r in records
+            r["verification"] != "passed" or r["nve_revision"] != revision
+            or int(r["threads"]) != case["callers"]
+            or int(r["disable_threadpool"]) != int(mode == "inline")
+            or (mode == "pool" and int(r["threadpool_workers_effective"]) != case["workers"])
+            for r in records
         ):
             raise SystemExit(f"Invalid results: {name}")
-        summary.append(dict(case=name, mode=args.mode, runs=len(records),
+        per_run.append(name + ": " + ", ".join(f"{float(r['mkps']):.2f}" for r in records))
+        summary.append(dict(case=name, mode=mode, runs=len(records),
             callers=case["callers"], workers=case["workers"], **{
                 field: f"{statistics.mean(float(r[field]) for r in records):.6f}" for field in FIELDS}))
     summary_path = out / "summary.csv"
@@ -218,7 +271,16 @@ def main():
     print(summary_path.read_text(), end="")
     print("Percentiles: average of per-run percentiles across callers; latency is under concurrent load.")
     print("Saved summary:", summary_path)
-    print("Later round reminder: compare THP madvise -> always; verify actual THP usage.")
+    if args.profile == "socket-tuning":
+        print("\nPer-run throughput (MKPS):")
+        print("\n".join(per_run))
+        (out / "results-for-chat.txt").write_text(
+            f"Server: {platform.node()}\nSource: {revision}\n"
+            f"THP: {read(thp / 'enabled')}\n"
+            + summary_path.read_text() + "\nPer-run throughput (MKPS):\n"
+            + "\n".join(per_run) + "\n")
+    else:
+        print("Later round reminder: compare THP madvise -> always; verify actual THP usage.")
 
 
 if __name__ == "__main__":

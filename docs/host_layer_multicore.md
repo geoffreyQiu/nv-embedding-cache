@@ -17,6 +17,43 @@ fetch from `https://github.com/geoffreyQiu/nv-embedding-cache.git` explicitly.
 The runner checks that the binary's embedded source revision matches the checkout
 before starting the large experiments. Rebuild after checking out a new commit.
 
+## One-socket caller tuning
+
+```bash
+python3 benchmarks/host_layer/multicore.py --profile socket-tuning --plan-only
+python3 benchmarks/host_layer/multicore.py --profile socket-tuning --repeats 5
+```
+
+This profile runs exactly four cases in shuffled order, five times each:
+
+| Case | Callers | Shared NVE workers | Selected physical cores |
+|---|---:|---:|---:|
+| Full socket pool | 1 | Cores in the first socket | All cores in that socket |
+| Full socket pool | 2 | Cores in the first socket | All cores in that socket |
+| Full socket pool | 4 | Cores in the first socket | All cores in that socket |
+| Inline | 64 | 0 | 64 cores in that socket |
+
+For Turin 192-core and Turin 128-core, the pool sizes are 192 and 128 respectively.
+Every case selects one hardware thread per physical core; SMT siblings are
+excluded. The inline case spreads its choices across the sorted physical-core
+CPU list. This is not a guarantee of optimal placement across caches. Threads
+can migrate within the selected CPU set. The first socket must have at least 64
+physical cores, and the exclusive allocation must expose all physical cores.
+Memory uses the selected cores' local node, or interleaves across their local
+nodes if the socket has multiple NUMA nodes.
+
+The task threshold stays at 1,024 keys, matching the baseline. A 16,384-key
+lookup creates at most 16 gather tasks, so 1, 2 and 4 concurrent callers can
+supply at most 16, 32 and 64 gather tasks at once. A full-size pool therefore
+does not guarantee full-socket utilization. These cases measure low-concurrency
+lookup behavior with a large pool, rather than maximum socket throughput.
+Caller threads are additional to the pool workers.
+
+The profile keeps host THP settings unchanged, prints per-run throughput as well
+as the summary, and saves a compact `results-for-chat.txt` in its results
+directory. It needs no previous results or copied CPU masks. Latency comparisons
+across the four cases still reflect different caller concurrency.
+
 ## Run
 
 ```bash
