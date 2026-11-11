@@ -78,6 +78,10 @@ fresh/replayed keys, metric arithmetic, CSV quoting/appending, and invalid input
 
 ## Thread and workload controls
 
+For topology-aware socket and whole-server experiments, see the
+[multicore runner instructions](host_layer_multicore.md). The runner is included
+in the repository and can be fetched with Git inside an existing container.
+
 | Flag | Meaning |
 |---|---|
 | `--threads/-t` | Concurrent inference callers per layer; default 1 |
