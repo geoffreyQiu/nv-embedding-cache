@@ -91,19 +91,24 @@ def make_cases(rows, allowed, memory_nodes, smt, mode):
     return cases
 
 
-def make_socket_tuning_cases(rows, allowed, memory_nodes):
-    """Few callers with a full socket pool, plus a 64-core inline comparison."""
+def make_socket_tuning_cases(rows, allowed, memory_nodes, pool_callers=(1, 2, 4),
+                             include_inline=True):
+    """Caller sweep with a full socket pool and an optional 64-core inline case."""
+    if not pool_callers or any(c <= 0 for c in pool_callers) or len(set(pool_callers)) != len(pool_callers):
+        raise ValueError("Pool caller counts must be positive and unique.")
     baseline = make_cases(rows, allowed, memory_nodes, False, "pool")
     name, socket = next((name, case) for name, case in baseline.items()
                         if name.startswith("socket"))
     prefix = name.removesuffix("-cores")
     cpus = socket["cpus"]
-    if len(cpus) < 64:
+    if include_inline and len(cpus) < 64:
         raise ValueError("Socket tuning requires at least 64 accessible physical cores in the first socket.")
     cases = {
         f"{prefix}-c{callers}-full-pool": dict(socket, mode="pool", callers=callers)
-        for callers in (1, 2, 4)
+        for callers in pool_callers
     }
+    if not include_inline:
+        return cases
     # Spread the 64 choices across the sorted CPU list instead of taking a prefix.
     # This is a CPU-set restriction, not permanent per-thread pinning.
     selected = [cpus[i * (len(cpus) - 1) // 63] for i in range(64)]
@@ -130,6 +135,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", choices=["baseline", "socket-tuning"], default="baseline",
                         help="socket-tuning: 1/2/4 callers with a full socket pool; 64 callers inline")
+    parser.add_argument("--pool-callers", nargs="+", type=int,
+                        help="socket-tuning pool caller counts (default: 1 2 4)")
+    parser.add_argument("--pool-only", action="store_true",
+                        help="socket-tuning: omit the 64-caller inline case")
     parser.add_argument("--mode", choices=["inline", "pool"], default="inline")
     parser.add_argument("--smt", action="store_true", help="also test all hardware threads")
     parser.add_argument("--repeats", type=int, default=5)
@@ -137,6 +146,12 @@ def main():
     args = parser.parse_args()
     if args.repeats < 1:
         parser.error("--repeats must be positive")
+    if args.profile != "socket-tuning" and (args.pool_callers is not None or args.pool_only):
+        parser.error("--pool-callers and --pool-only require --profile socket-tuning")
+    if args.pool_callers is not None and (
+        any(c <= 0 for c in args.pool_callers) or len(set(args.pool_callers)) != len(args.pool_callers)
+    ):
+        parser.error("--pool-callers must contain positive, unique counts")
     if args.profile == "socket-tuning" and (args.mode != "inline" or args.smt):
         parser.error("socket-tuning defines its own pool/inline cases and uses one hardware thread per core; omit --mode and --smt")
     revision = command(["git", "rev-parse", "HEAD"])
@@ -155,7 +170,9 @@ def main():
         if match and int(match[1]) > 0 and node_id in mem_allowed:
             memory_nodes.add(node_id)
     if args.profile == "socket-tuning":
-        cases = make_socket_tuning_cases(rows, os.sched_getaffinity(0), memory_nodes)
+        cases = make_socket_tuning_cases(rows, os.sched_getaffinity(0), memory_nodes,
+            pool_callers=args.pool_callers if args.pool_callers is not None else (1, 2, 4),
+            include_inline=not args.pool_only)
     else:
         cases = make_cases(rows, os.sched_getaffinity(0), memory_nodes, args.smt, args.mode)
     mode_label = "socket-tuning" if args.profile == "socket-tuning" else args.mode

@@ -98,9 +98,9 @@ class SocketTuningTests(unittest.TestCase):
         return [(socket * cores + core + sibling * cores * 2, core, socket, socket)
                 for socket in range(2) for core in range(cores) for sibling in range(2)]
 
-    def cases(self, cores):
+    def cases(self, cores, **kwargs):
         rows = self.topology(cores)
-        return RUNNER.make_socket_tuning_cases(rows, {r[0] for r in rows}, {0, 1})
+        return RUNNER.make_socket_tuning_cases(rows, {r[0] for r in rows}, {0, 1}, **kwargs)
 
     def test_both_turin_sizes_use_full_pool_and_one_thread_per_core(self):
         for cores in (128, 192):
@@ -131,6 +131,31 @@ class SocketTuningTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "at least 64"):
             self.cases(32)
 
+    def test_custom_pool_only_cases_on_both_turins(self):
+        for cores in (128, 192):
+            with self.subTest(cores=cores):
+                cases = self.cases(cores, pool_callers=(16, 32, 64), include_inline=False)
+                self.assertEqual(list(cases), [f"socket0-c{c}-full-pool" for c in (16, 32, 64)])
+                for case, callers in zip(cases.values(), (16, 32, 64)):
+                    self.assertEqual((case["mode"], case["callers"], case["workers"]),
+                                     ("pool", callers, cores))
+                    self.assertEqual(case["cpus"], list(range(cores)))
+                    self.assertEqual((case["nodes"], case["memory_policy"]), ([0], "membind"))
+
+    def test_invalid_pool_caller_counts_are_rejected(self):
+        for counts in ((), (0, 16), (-1,), (16, 16)):
+            with self.subTest(counts=counts), self.assertRaisesRegex(ValueError, "positive and unique"):
+                self.cases(128, pool_callers=counts, include_inline=False)
+
+    def test_pool_options_require_socket_profile_and_valid_counts(self):
+        for argv in (["--pool-only"], ["--pool-callers", "16"],
+                     ["--profile", "socket-tuning", "--pool-callers", "0"],
+                     ["--profile", "socket-tuning", "--pool-callers", "16", "16"]):
+            with self.subTest(argv=argv), patch("sys.argv", ["runner", *argv]), \
+                 contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                RUNNER.main()
+            self.assertEqual(error.exception.code, 2)
+
     def test_profile_rejects_smt(self):
         with patch("sys.argv", ["runner", "--profile", "socket-tuning", "--smt"]), \
              contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
@@ -138,7 +163,14 @@ class SocketTuningTests(unittest.TestCase):
         self.assertEqual(error.exception.code, 2)
 
     def test_mixed_profile_runs_and_summarizes_all_four_cases(self):
-        cases = self.cases(128)
+        self.run_profile((1, 2, 4), True, [])
+
+    def test_custom_pool_only_runs_and_summarizes_exactly_three_cases(self):
+        self.run_profile((16, 32, 64), False,
+                         ["--pool-callers", "16", "32", "64", "--pool-only"])
+
+    def run_profile(self, pool_callers, include_inline, extra_args):
+        cases = self.cases(128, pool_callers=pool_callers, include_inline=include_inline)
         calls = []
 
         def fake_run(cmd, **kwargs):
@@ -150,7 +182,7 @@ class SocketTuningTests(unittest.TestCase):
                 self.assertNotIn("--threadpool_workers", cmd)
                 workers = 1  # NVE InlineThreadPool reports one worker.
             else:
-                self.assertIn(callers, (1, 2, 4))
+                self.assertIn(callers, pool_callers)
                 workers = int(cmd[cmd.index("--threadpool_workers") + 1])
                 self.assertEqual(workers, 128)
             self.assertEqual(kwargs["env"]["CUDA_VISIBLE_DEVICES"], "-1")
@@ -187,21 +219,24 @@ class SocketTuningTests(unittest.TestCase):
                 binary = Path("build-host-layer/bin/host_layer_bench")
                 binary.parent.mkdir(parents=True)
                 binary.touch()
-                with patch("sys.argv", ["runner", "--profile", "socket-tuning"]), \
+                with patch("sys.argv", ["runner", "--profile", "socket-tuning", *extra_args]), \
                      patch.object(RUNNER, "command", side_effect=fake_command), \
                      patch.object(RUNNER, "read", side_effect=fake_read), \
-                     patch.object(RUNNER, "make_socket_tuning_cases", return_value=cases), \
+                     patch.object(RUNNER, "make_socket_tuning_cases", return_value=cases) as case_builder, \
                      patch.object(RUNNER, "verify_binary") as preflight, \
                      patch.object(RUNNER.subprocess, "run", side_effect=fake_run), \
                      contextlib.redirect_stdout(io.StringIO()) as output:
                     RUNNER.main()
                 preflight.assert_called_once()
-                self.assertEqual(len(calls), 20)
+                self.assertEqual(tuple(case_builder.call_args.kwargs["pool_callers"]), pool_callers)
+                self.assertEqual(case_builder.call_args.kwargs["include_inline"], include_inline)
+                expected_modes = ["pool"] * len(pool_callers) + (["inline"] if include_inline else [])
+                self.assertEqual(len(calls), 5 * len(expected_modes))
                 summary = next(Path("build-host-layer/results").glob("*/summary.csv"))
                 with summary.open(newline="") as f:
                     rows = list(csv.DictReader(f))
-                self.assertEqual([r["mode"] for r in rows], ["pool", "pool", "pool", "inline"])
-                self.assertEqual([r["runs"] for r in rows], ["5"] * 4)
+                self.assertEqual([r["mode"] for r in rows], expected_modes)
+                self.assertEqual([r["runs"] for r in rows], ["5"] * len(expected_modes))
                 self.assertTrue((summary.parent / "results-for-chat.txt").is_file())
                 self.assertNotIn("Later round reminder", output.getvalue())
             finally:

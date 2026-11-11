@@ -54,6 +54,30 @@ as the summary, and saves a compact `results-for-chat.txt` in its results
 directory. It needs no previous results or copied CPU masks. Latency comparisons
 across the four cases still reflect different caller concurrency.
 
+To run only **16, 32 and 64 callers**, each using the same full socket pool:
+
+```bash
+python3 benchmarks/host_layer/multicore.py --profile socket-tuning \
+  --pool-callers 16 32 64 --pool-only --plan-only
+
+python3 benchmarks/host_layer/multicore.py --profile socket-tuning \
+  --pool-callers 16 32 64 --pool-only --repeats 5
+```
+
+This runs exactly three cases, using 192 shared workers on Turin 192-core or
+128 shared workers on Turin 128-core. Worker count is per process, not per
+caller. All callers and workers share the first socket's physical-core CPU set,
+with one hardware thread per core. At the unchanged task threshold, even 16
+callers can supply up to 256 gather tasks across their outstanding lookups,
+which exceeds either pool size. This removes the low-caller task-count limit;
+actual utilization and performance still depend on scheduling and contention.
+Callers are additional software threads, so more callers can introduce overhead.
+THP settings, request size, table, key distribution and timing phases remain
+the same. Each case runs in its own process and shares one table and one pool.
+
+`--pool-callers` accepts any positive, unique caller counts. Omitting
+`--pool-only` also runs the existing 64-caller inline comparison.
+
 ## Run
 
 ```bash
