@@ -56,10 +56,9 @@ struct Config {
   int64_t num_rows, embedding_dim, batch, hotness, num_layers, threads;
   int64_t num_steps, num_warmup_steps, latency_steps, threadpool_workers;
   int64_t task_size_threshold, hitrate_interval;
-  int64_t key_buffer_steps, latency_sample_limit;
+  int64_t key_buffer_steps;
   uint64_t seed;
   double alpha, max_latency_ms;
-  double warmup_seconds, throughput_seconds, latency_seconds;
   bool disable_threadpool;
   std::string data_type, latency_keys, csv_filename, tag;
   std::string caller_cpus_text, worker_cpus_text;
@@ -197,21 +196,19 @@ class Barrier final {
 };
 
 Config parse(int argc, char** argv) {
-  argparse::ArgumentParser a("host_layer_bench");
+  argparse::ArgumentParser a("host_layer_bench",NVE_SOURCE_REV);
   a.add_description("CPU-only inference lookup through real NVE HostEmbeddingLayer; no pooling");
   a.add_argument("-nr", "--num_table_rows").default_value(int64_t(1000000)).scan<'i',int64_t>();
   a.add_argument("-ed", "--embedding_dim").default_value(int64_t(128)).scan<'i',int64_t>();
   a.add_argument("-dt", "--data_type").default_value(std::string("float32"));
   a.add_argument("-b", "--batch").default_value(int64_t(256)).scan<'i',int64_t>();
   a.add_argument("--hotness").default_value(int64_t(1024)).scan<'i',int64_t>();
-  a.add_argument("-a", "--alpha").default_value(1.05).scan<'g',double>().help("power-law exponent; <= 0 is uniform");
+  a.add_argument("-a", "--alpha").default_value(1.15).scan<'g',double>().help("power-law exponent; <= 0 is uniform");
   a.add_argument("-nl", "--num_layers").default_value(int64_t(1)).scan<'i',int64_t>();
   a.add_argument("-t", "--threads").default_value(int64_t(1)).scan<'i',int64_t>().help("concurrent inference callers per layer");
-  a.add_argument("-ns", "--num_steps").default_value(int64_t(100)).scan<'i',int64_t>()
-      .help("fixed-step mode: throughput calls per caller; ignored in timed mode");
+  a.add_argument("-ns", "--num_steps").default_value(int64_t(100)).scan<'i',int64_t>();
   a.add_argument("-nw", "--num_warmup_steps").default_value(int64_t(100)).scan<'i',int64_t>();
-  a.add_argument("--latency_steps").default_value(int64_t(-1)).scan<'i',int64_t>()
-      .help("fixed-step mode: -1 = num_steps, 0 = skip; ignored in timed mode");
+  a.add_argument("--latency_steps").default_value(int64_t(-1)).scan<'i',int64_t>().help("-1 = num_steps, 0 = skip");
   a.add_argument("--latency_keys").default_value(std::string("fresh")).help("fresh | replay");
   a.add_argument("--threadpool_workers").default_value(int64_t(1)).scan<'i',int64_t>().help("shared NVE workers; 0 = library default");
   a.add_argument("--disable_threadpool").default_value(false).implicit_value(true).help("run on inference callers instead of NVE workers");
@@ -221,15 +218,10 @@ Config parse(int argc, char** argv) {
   a.add_argument("--seed").default_value(uint64_t(42)).scan<'u',uint64_t>();
   a.add_argument("-csv", "--csv_filename").default_value(std::string(""));
   a.add_argument("--tag").default_value(std::string(""));
-  a.add_argument("--throughput_seconds").default_value(0.0).scan<'g',double>();
-  a.add_argument("--latency_seconds").default_value(0.0).scan<'g',double>();
-  a.add_argument("--warmup_seconds").default_value(0.0).scan<'g',double>();
   a.add_argument("--key_buffer_steps").default_value(int64_t(512)).scan<'i',int64_t>()
-      .help("timed mode: pre-generated batches per caller, replayed cyclically");
-  a.add_argument("--latency_sample_limit").default_value(int64_t(1000000)).scan<'i',int64_t>()
-      .help("timed mode: preallocated latency sample capacity per caller; overflow fails the run");
-  a.add_argument("--caller_cpus").default_value(std::string("")).help("ordered comma-separated CPU IDs, one per caller");
-  a.add_argument("--worker_cpus").default_value(std::string("")).help("comma-separated CPU IDs, one per shared pool worker");
+      .help("maximum pre-generated batches per caller; replay cyclically for longer phases");
+  a.add_argument("--caller_cpus").default_value(std::string("")).help("one logical CPU ID per caller");
+  a.add_argument("--worker_cpus").default_value(std::string("")).help("one logical CPU ID per NVE worker");
   a.parse_args(argc, argv);
   Config c{};
 #define GET(field, type, flag) c.field = a.get<type>(flag)
@@ -243,9 +235,7 @@ Config parse(int argc, char** argv) {
   GET(disable_threadpool,bool,"--disable_threadpool"); GET(data_type,std::string,"--data_type");
   GET(latency_keys,std::string,"--latency_keys"); GET(csv_filename,std::string,"--csv_filename");
   GET(tag,std::string,"--tag");
-  GET(throughput_seconds,double,"--throughput_seconds"); GET(latency_seconds,double,"--latency_seconds");
-  GET(warmup_seconds,double,"--warmup_seconds"); GET(key_buffer_steps,int64_t,"--key_buffer_steps");
-  GET(latency_sample_limit,int64_t,"--latency_sample_limit");
+  GET(key_buffer_steps,int64_t,"--key_buffer_steps");
   GET(caller_cpus_text,std::string,"--caller_cpus"); GET(worker_cpus_text,std::string,"--worker_cpus");
 #undef GET
   require(c.num_rows>0 && c.num_rows <= (int64_t(1)<<53) && c.embedding_dim>0 && c.batch>0 && c.hotness>0,
@@ -256,20 +246,13 @@ Config parse(int argc, char** argv) {
   require(std::isfinite(c.alpha) && std::isfinite(c.max_latency_ms) && c.max_latency_ms>=0, "alpha/latency budget must be finite; budget >= 0");
   require(c.latency_keys=="fresh" || c.latency_keys=="replay", "latency_keys must be fresh or replay");
   require(c.data_type=="float32" || c.data_type=="float16", "data_type must be float32 or float16");
-  require(std::isfinite(c.throughput_seconds) && std::isfinite(c.latency_seconds) &&
-          std::isfinite(c.warmup_seconds) && c.throughput_seconds>=0 && c.latency_seconds>=0 &&
-          c.warmup_seconds>=0 && c.throughput_seconds<=86400 && c.latency_seconds<=86400 &&
-          c.warmup_seconds<=86400,"phase durations must be finite and between 0 and 86400 seconds");
-  require((c.throughput_seconds>0)==(c.latency_seconds>0),"timed mode requires both measured phase durations");
-  require(c.warmup_seconds==0 || c.throughput_seconds>0,"warmup_seconds requires timed mode");
-  require(c.key_buffer_steps>0 && c.latency_sample_limit>0,"key buffer and sample capacity must be positive");
   if (c.latency_steps==-1) c.latency_steps=c.num_steps;
   c.row_bytes=product(c.embedding_dim,c.data_type=="float32"?4:2);
   c.keys_per_step=product(c.batch,c.hotness);
   c.table_bytes=product(c.num_rows,c.row_bytes);
   c.total_threads=product(c.num_layers,c.threads);
-  c.key_steps=c.throughput_seconds>0 ? c.key_buffer_steps :
-      (c.latency_keys=="fresh" ? std::max(c.num_steps,c.latency_steps) : c.num_steps);
+  require(c.key_buffer_steps>0,"key_buffer_steps must be positive");
+  c.key_steps=std::min(c.key_buffer_steps,c.latency_keys=="fresh" ? std::max(c.num_steps,c.latency_steps) : c.num_steps);
   c.caller_cpus=cpu_list(c.caller_cpus_text); c.worker_cpus=cpu_list(c.worker_cpus_text);
   require(c.caller_cpus.empty() || c.caller_cpus.size()==c.total_threads,"caller_cpus must have one CPU per caller");
   require(c.worker_cpus.empty() || (!c.disable_threadpool && c.threadpool_workers>0 &&
@@ -310,34 +293,8 @@ struct Layer {
 };
 struct Result {
   Clock::time_point start,end,lat_start,lat_end;
-  uint64_t throughput_calls{};
   std::vector<double> latency, hits, lat_hits;
 };
-struct TimedPhases {
-  Clock::time_point start,deadline;
-  int64_t throughput_huge_kib{-1},latency_huge_kib{-1};
-};
-int64_t anon_huge_kib() {
-  std::ifstream in("/proc/self/smaps_rollup");
-  std::string line;
-  while (std::getline(in,line)) {
-    if (line.rfind("AnonHugePages:",0)==0) {
-      std::istringstream row(line);
-      std::string field; int64_t value{};
-      if (row>>field>>value) return value;
-    }
-  }
-  return -1;
-}
-void begin_phase(double duration, size_t idx, Barrier& barrier, TimedPhases& phase) {
-  barrier.wait();
-  if (idx==0) {
-    phase.start=Clock::now()+std::chrono::milliseconds(50);
-    phase.deadline=phase.start+std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(duration));
-  }
-  barrier.wait();
-  std::this_thread::sleep_until(phase.start);
-}
 void verify(const Config& c, const Layer& l, nve::context_ptr_t& ctx) {
   const std::vector<IndexT> keys{0,c.num_rows/2,c.num_rows-1,-1,c.num_rows};
   std::vector<uint8_t> out(keys.size()*c.row_bytes,0xff);
@@ -360,7 +317,7 @@ void worker(const Config& c, const Layer& l, nve::context_ptr_t ctx, size_t idx,
   std::vector<IndexT> warm(c.keys_per_step);
   std::vector<uint8_t> out(c.keys_per_step*c.row_bytes);
   KeyGenerator gen(c,c.seed+1000*(idx+1));
-  gen.fill(keys.data(),c.keys_per_step*c.num_steps);
+  gen.fill(keys.data(),keys.size());
   for (int64_t s=0;s<c.num_warmup_steps;++s) {
     gen.fill(warm.data(),warm.size());
     l.layer->lookup(ctx,c.keys_per_step,warm.data(),out.data(),c.row_bytes,nullptr,nullptr,nullptr);
@@ -368,12 +325,12 @@ void worker(const Config& c, const Layer& l, nve::context_ptr_t ctx, size_t idx,
   // One untimed full-size lookup also first-touches output/scratch when warmup=0.
   l.layer->lookup(ctx,c.keys_per_step,keys.data(),out.data(),c.row_bytes,nullptr,nullptr,nullptr);
   const size_t samples=c.hitrate_interval ? (c.num_steps-1)/c.hitrate_interval+1 : 0;
-  r.hits.reserve(samples);
-  r.lat_hits.reserve(c.hitrate_interval && c.latency_steps ? (c.latency_steps-1)/c.hitrate_interval+1 : 0);
-  r.latency.reserve(c.latency_steps);
+  r.hits.resize(samples); r.hits.clear();
+  r.lat_hits.resize(c.hitrate_interval && c.latency_steps ? (c.latency_steps-1)/c.hitrate_interval+1 : 0); r.lat_hits.clear();
+  r.latency.resize(c.latency_steps); // allocate and first-touch samples outside timing
   float hit=0;
   auto lookup=[&](size_t step, bool collect) {
-    l.layer->lookup(ctx,c.keys_per_step,keys.data()+step*c.keys_per_step,out.data(),
+    l.layer->lookup(ctx,c.keys_per_step,keys.data()+(step%c.key_steps)*c.keys_per_step,out.data(),
                     c.row_bytes,nullptr,nullptr,collect?&hit:nullptr);
   };
   barrier.wait();
@@ -384,10 +341,9 @@ void worker(const Config& c, const Layer& l, nve::context_ptr_t ctx, size_t idx,
     if (collect) r.hits.push_back(hit);
   }
   r.end=Clock::now();
-  r.throughput_calls=c.num_steps;
   // Prevent fresh key generation from interfering with any caller's throughput interval.
   barrier.wait();
-  if (c.latency_keys=="fresh" && c.latency_steps) gen.fill(keys.data(),c.keys_per_step*c.latency_steps);
+  if (c.latency_keys=="fresh" && c.latency_steps) gen.fill(keys.data(),keys.size());
   barrier.wait();
   r.lat_start=Clock::now();
   for (int64_t s=0;s<c.latency_steps;++s) {
@@ -395,83 +351,16 @@ void worker(const Config& c, const Layer& l, nve::context_ptr_t ctx, size_t idx,
     auto begin=Clock::now();
     lookup(c.latency_keys=="fresh"?s:s%c.num_steps,collect);
     const auto end=Clock::now();
-    r.latency.push_back(seconds(begin,end)*1000);
+    r.latency[s]=seconds(begin,end)*1000;
     if (collect) r.lat_hits.push_back(hit);
   }
   r.lat_end=Clock::now();
   barrier.wait(); // don't free buffers or verify while another caller is measuring
   const size_t last=c.latency_steps ? (c.latency_keys=="fresh"?c.latency_steps-1:(c.latency_steps-1)%c.num_steps) : c.num_steps-1;
-  const auto* final_keys=keys.data()+last*c.keys_per_step;
+  const auto* final_keys=keys.data()+(last%c.key_steps)*c.keys_per_step;
   for (size_t i=0;i<c.keys_per_step;++i) {
     require(std::memcmp(out.data()+i*c.row_bytes,l.data.data()+final_keys[i]*c.row_bytes,c.row_bytes)==0,
             "final measured output verification failed");
-  }
-}
-void worker_timed(const Config& c, const Layer& l, nve::context_ptr_t ctx, size_t idx,
-                  Barrier& barrier, TimedPhases& phase, Result& r) {
-  std::vector<IndexT> keys(c.keys_per_step*c.key_steps);
-  std::vector<uint8_t> out(c.keys_per_step*c.row_bytes);
-  KeyGenerator gen(c,c.seed+1000*(idx+1));
-  gen.fill(keys.data(),keys.size());
-  // Allocate and first-touch sample pages outside timing, retaining capacity.
-  r.latency.resize(c.latency_sample_limit); r.latency.clear();
-  if (c.hitrate_interval) {
-    r.hits.resize(c.latency_sample_limit); r.hits.clear();
-    r.lat_hits.resize(c.latency_sample_limit); r.lat_hits.clear();
-  }
-  size_t last{};
-  float hit{};
-  auto lookup=[&](uint64_t step,bool collect) {
-    last=step%c.key_steps;
-    l.layer->lookup(ctx,c.keys_per_step,keys.data()+last*c.keys_per_step,out.data(),
-                   c.row_bytes,nullptr,nullptr,collect?&hit:nullptr);
-  };
-  auto warmup=[&] {
-    begin_phase(c.warmup_seconds,idx,barrier,phase);
-    uint64_t step{};
-    do { lookup(step++,false); }
-    while (step<static_cast<uint64_t>(c.num_warmup_steps) || Clock::now()<phase.deadline);
-    barrier.wait();
-  };
-  warmup();
-  begin_phase(c.throughput_seconds,idx,barrier,phase);
-  r.start=phase.start;
-  do {
-    const bool collect=c.hitrate_interval && r.throughput_calls%c.hitrate_interval==0;
-    lookup(r.throughput_calls,collect);
-    ++r.throughput_calls;
-    if (collect) {
-      require(r.hits.size()<static_cast<size_t>(c.latency_sample_limit),"throughput hit sample capacity exceeded");
-      r.hits.push_back(hit);
-    }
-  } while (Clock::now()<phase.deadline);
-  r.end=Clock::now();
-  barrier.wait();
-  if (idx==0) phase.throughput_huge_kib=anon_huge_kib();
-  barrier.wait();
-  if (c.latency_keys=="fresh") gen.fill(keys.data(),keys.size());
-  // Warm the latency phase's own ring outside its measured interval.
-  warmup();
-  begin_phase(c.latency_seconds,idx,barrier,phase);
-  r.lat_start=phase.start;
-  do {
-    const size_t step=r.latency.size();
-    require(step<static_cast<size_t>(c.latency_sample_limit),"latency sample capacity exceeded");
-    const bool collect=c.hitrate_interval && step%c.hitrate_interval==0;
-    const auto begin=Clock::now();
-    lookup(step,collect);
-    const auto end=Clock::now();
-    r.latency.push_back(seconds(begin,end)*1000);
-    if (collect) r.lat_hits.push_back(hit);
-  } while (Clock::now()<phase.deadline);
-  r.lat_end=Clock::now();
-  barrier.wait();
-  if (idx==0) phase.latency_huge_kib=anon_huge_kib();
-  barrier.wait();
-  for (size_t i=0;i<c.keys_per_step;++i) {
-    const auto key=keys[last*c.keys_per_step+i];
-    require(std::memcmp(out.data()+i*c.row_bytes,l.data.data()+key*c.row_bytes,c.row_bytes)==0,
-            "final timed gather verification failed");
   }
 }
 std::string number(double x) { std::ostringstream s; s<<std::setprecision(12)<<x; return s.str(); }
@@ -526,10 +415,6 @@ int run(const Config& c) {
            <<", inline "<<c.disable_threadpool<<", alpha "<<c.alpha<<"\n"
            <<"Host key buffer GiB/caller "<<number(static_cast<double>(c.keys_per_step*c.key_steps*sizeof(IndexT))/gib)
            <<", output GiB/caller "<<number(static_cast<double>(c.keys_per_step*c.row_bytes)/gib)<<std::endl;
-  if (c.throughput_seconds>0)
-    std::cout<<"Duration mode: throughput "<<c.throughput_seconds<<" s, latency "<<c.latency_seconds
-             <<" s; warmup before each phase >= "<<c.warmup_seconds<<" s and "<<c.num_warmup_steps
-             <<" calls/caller; replay ring "<<c.key_steps<<" batches/caller\n"<<std::flush;
   std::vector<Layer> layers(c.num_layers);
   double prefill_s=0;
   for (size_t i=0;i<layers.size();++i) {
@@ -557,14 +442,12 @@ int run(const Config& c) {
   const double setup_s=seconds(setup,Clock::now());
   std::vector<Result> results(c.total_threads);
   Barrier barrier(c.total_threads);
-  TimedPhases phase;
   std::vector<std::thread> callers;
   for(size_t i=0;i<c.total_threads;++i) {
     callers.emplace_back([&,i] {
       try {
         if (!c.caller_cpus.empty()) pin_cpu(c.caller_cpus[i]);
-        if (c.throughput_seconds>0) worker_timed(c,layers[i/c.threads],contexts[i],i,barrier,phase,results[i]);
-        else worker(c,layers[i/c.threads],contexts[i],i,barrier,results[i]);
+        worker(c,layers[i/c.threads],contexts[i],i,barrier,results[i]);
       }
       catch(const std::exception& e) {
         // Fail fast: peers may be blocked at a phase barrier. Never emit partial metrics.
@@ -580,9 +463,7 @@ int run(const Config& c) {
     return seconds(start,end);
   };
   const double elapsed=window(0,results.size());
-  const auto completed=std::accumulate(results.begin(),results.end(),uint64_t{},
-      [](uint64_t n,const Result& r){return n+r.throughput_calls;});
-  const double total_keys=static_cast<double>(completed)*static_cast<double>(c.keys_per_step);
+  const double total_keys=static_cast<double>(c.total_threads)*static_cast<double>(c.num_steps)*static_cast<double>(c.keys_per_step);
   const double kps=total_keys/elapsed;
   std::vector<double> lat,hits,lat_hits;
   for(const auto& r:results) {
@@ -595,11 +476,8 @@ int run(const Config& c) {
   std::cout<<"Time: "<<number(elapsed)<<", MKPS: "<<number(kps/1e6)
            <<", Algo BW: "<<number(kps*static_cast<double>(c.row_bytes)/1e9)<<" GB/s ("
            <<number(kps*static_cast<double>(c.row_bytes)/gib)<<" GiB/s)\n";
-  for(size_t i=0;i<layers.size();++i) {
-    uint64_t calls{};
-    for(size_t j=i*c.threads;j<(i+1)*c.threads;++j) calls+=results[j].throughput_calls;
-    std::cout<<"Layer "<<i<<" MKPS: "<<number(static_cast<double>(calls)*static_cast<double>(c.keys_per_step)/window(i*c.threads,(i+1)*c.threads)/1e6)<<"\n";
-  }
+  for(size_t i=0;i<layers.size();++i)
+    std::cout<<"Layer "<<i<<" MKPS: "<<number(static_cast<double>(c.threads)*static_cast<double>(c.num_steps)*static_cast<double>(c.keys_per_step)/window(i*c.threads,(i+1)*c.threads)/1e6)<<"\n";
   if(!hits.empty()) std::cout<<"Host hitrate: "<<mean(hits)<<" over "<<hits.size()<<" samples\n";
   if(!lat.empty()) {
     std::cout<<"Latency ms ("<<lat.size()<<" samples): mean "<<number(mean(lat))
@@ -639,19 +517,10 @@ int run(const Config& c) {
   add("setup_s",setup_s); add("prefill_s",prefill_s); add("peak_rss_kib",usage.ru_maxrss);
   add("verification","passed");
   auto lat_start=results.front().lat_start,lat_end=results.front().lat_end;
-  uint64_t min_calls=results.front().throughput_calls,max_calls=min_calls;
-  for(const auto& r:results) {
-    lat_start=std::min(lat_start,r.lat_start); lat_end=std::max(lat_end,r.lat_end);
-    min_calls=std::min(min_calls,r.throughput_calls); max_calls=std::max(max_calls,r.throughput_calls);
-  }
-  add("timing_mode",c.throughput_seconds>0?"duration":"steps");
-  add("throughput_seconds_requested",c.throughput_seconds); add("latency_seconds_requested",c.latency_seconds);
-  add("warmup_seconds_requested",c.warmup_seconds); add("key_buffer_steps_effective",c.key_steps);
-  add("throughput_completed_calls",completed); add("throughput_calls_min_per_caller",min_calls);
-  add("throughput_calls_max_per_caller",max_calls); add("latency_time_s",seconds(lat_start,lat_end));
+  for(const auto& r:results) { lat_start=std::min(lat_start,r.lat_start); lat_end=std::max(lat_end,r.lat_end); }
+  add("latency_time_s",seconds(lat_start,lat_end)); add("key_buffer_steps_effective",c.key_steps);
   add("caller_cpus",c.caller_cpus_text); add("worker_cpus",c.worker_cpus_text);
-  add("throughput_anon_huge_kib",phase.throughput_huge_kib); add("latency_anon_huge_kib",phase.latency_huge_kib);
-  std::cout<<"Completed throughput calls: "<<completed<<"; latency phase seconds: "<<seconds(lat_start,lat_end)<<"\n";
+  std::cout<<"Latency phase time: "<<seconds(lat_start,lat_end)<<" s\n";
   if(!c.csv_filename.empty()) csv(c.csv_filename,m);
   std::cout<<"Verification: passed (preflight, missing keys, final measured output)\n";
   return 0;

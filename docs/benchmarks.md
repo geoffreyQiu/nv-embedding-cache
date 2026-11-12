@@ -88,18 +88,9 @@ the setup, prefill and file creation times.
 
 ## HostLayer CPU Inference Benchmark
 
-`host_layer_bench` measures the CPU-only `HostEmbeddingLayer` lookup path, with
-power-law/uniform keys, concurrent callers, configurable NVE workers, throughput,
-latency percentiles and CSV output. It is independent of PyTorch and needs no GPU.
-
-```bash
-bash benchmarks/host_layer/build.sh
-./build-host-layer/bin/host_layer_bench --alpha 1.05 --threads 1 --disable_threadpool
-```
-
-A Docker build/run workflow starts from `nvcr.io/nvidia/pytorch:26.03-py3`.
-See [HostLayer benchmark](host_layer_benchmark.md) for build flags, thread controls,
-measurement boundaries, tests, NUMA guidance and memory requirements.
+`host_layer_bench` mirrors the C++ single-layer benchmark for CPU inference.
+[Build, test and run guide](host_layer_benchmark.md): one shared 16 GiB table,
+power law alpha=1.15, physical-core binding and three socket/server scenarios.
 
 ## Multi GPU Benchmark
 
