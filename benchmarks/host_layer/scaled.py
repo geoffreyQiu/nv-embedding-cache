@@ -5,6 +5,7 @@
 import argparse
 import collections
 import csv
+import io
 import json
 import math
 import os
@@ -20,7 +21,7 @@ from pathlib import Path
 from multicore import command, numbers, read, verify_binary
 
 FIELDS = ["mkps", "gbps", "lat_mean_ms", "lat_p50_ms", "lat_p95_ms", "lat_p99_ms"]
-ALPHAS = {"powerlaw": 1.15, "uniform": 0.0}
+ALPHAS = {"powerlaw": 1.15}
 
 
 def spread(cpus, count):
@@ -221,8 +222,23 @@ def write_summary(out, records):
 def report(out):
     plan = json.loads((out / "plan.json").read_text())
     env = json.loads((out / "environment.json").read_text())
+    # Older runs may contain the unrequested uniform workload. Keep their raw
+    # files intact, but exclude it from this comparison and its completion count.
+    runs_path = out / "runs.csv"
+    all_runs = []
+    if runs_path.exists():
+        with runs_path.open(newline="") as f:
+            all_runs = list(csv.DictReader(f))
+    runs = [r for r in all_runs if r["distribution"] == "powerlaw"]
+    counts = collections.Counter(r["case"] for r in runs)
+    expected = len(plan["cases"]) * plan["repeats"]
+    complete = set(counts) == set(plan["cases"]) and all(counts[c] == plan["repeats"] for c in plan["cases"])
+    status = "complete" if complete else "incomplete"
     lines = [f"Server: {env['server']}", f"Source: {plan['revision']}",
-             f"Status: {plan['status']}; completed {plan.get('completed_runs', 0)}/{plan['expected_runs']} runs"]
+             f"Status: {status}; completed {len(runs)}/{expected} power-law runs",
+             "Distribution: powerlaw; alpha=1.15"]
+    if len(all_runs) != len(runs):
+        lines.append(f"Excluded {len(all_runs) - len(runs)} unrequested non-power-law runs; original files retained.")
     for key in ("Model name", "Architecture", "Socket(s)", "Core(s) per socket", "Thread(s) per core", "CPU(s)", "NUMA node(s)", "kernel", "container_os", "glibc",
                 "ngc_release", "pytorch", "compiler", "cuda_toolkit", "base_page_bytes", "l3_bytes_per_socket",
                 "scaling_driver", "scaling_governor", "scaling_min_freq", "scaling_max_freq", "energy_performance_preference", "numa_balancing", "THP", "cgroup"):
@@ -235,13 +251,21 @@ def report(out):
               "Full-core latency uses different caller counts on different products.",
               "AnonHugePages is process-wide, sampled after each phase outside timing."]
     summary = out / "summary.csv"
-    lines += ["", summary.read_text() if summary.exists() else "No completed measurements."]
-    runs_path = out / "runs.csv"
-    if runs_path.exists():
+    summary_text = "No completed power-law measurements."
+    if summary.exists():
+        with summary.open(newline="") as f:
+            reader = csv.DictReader(f)
+            selected = [r for r in reader if r["distribution"] == "powerlaw"]
+            if selected:
+                buffer = io.StringIO()
+                writer = csv.DictWriter(buffer, fieldnames=reader.fieldnames)
+                writer.writeheader(); writer.writerows(selected)
+                summary_text = buffer.getvalue()
+    lines += ["", summary_text]
+    if runs:
         groups = collections.defaultdict(list)
-        with runs_path.open(newline="") as f:
-            for r in csv.DictReader(f):
-                groups[(r["distribution"], r["case"])].append(float(r["mkps"]))
+        for r in runs:
+            groups[(r["distribution"], r["case"])].append(float(r["mkps"]))
         lines.append("Per-run throughput (MKPS):")
         lines += [f"{d}/{c}: " + ", ".join(f"{v:.2f}" for v in values) for (d, c), values in sorted(groups.items())]
     text = "\n".join(lines) + "\n"
@@ -255,7 +279,8 @@ def main():
     p.add_argument("--seconds", type=float, default=10)
     p.add_argument("--repeats", type=int, default=5)
     p.add_argument("--table-gib", type=int, default=16)
-    p.add_argument("--distributions", nargs="+", choices=list(ALPHAS), default=list(ALPHAS))
+    p.add_argument("--distributions", nargs="+", choices=list(ALPHAS), default=["powerlaw"],
+                   help="only the requested power law (alpha=1.15) is supported")
     p.add_argument("--smoke", action="store_true", help="tiny real-NVE validation; not performance data")
     p.add_argument("--plan-only", action="store_true")
     p.add_argument("--report", type=Path, help="print a saved run's environment and results; use 'latest' for the latest full run")
@@ -307,6 +332,7 @@ def main():
     save_plan()
     print("Server:", platform.node(), "| Results:", out, flush=True)
     print(f"Shared table: {config['rows'] * 512 / 2**30:.3f} GiB; per-phase seconds: {config['seconds']}; repeats: {repeats}")
+    print(f"Distribution: powerlaw; alpha=1.15; expected runs: {plan['expected_runs']}")
     print(f"Largest main-buffer plus reserved sample estimate: {memory_gib:.2f} GiB")
     print("THP:", env["THP"]["enabled"], "| L3 bytes/socket:", env["l3_bytes_per_socket"] or "unreported")
     for name, c in cases.items():

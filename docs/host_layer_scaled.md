@@ -10,7 +10,7 @@ PyTorch is part of the container environment, not the measured execution path.
 |---|---|
 | Table | One shared 16 GiB table: 33,554,432 rows x 128 FP32 values |
 | Request | 32 x 512 = 16,384 keys, 8 MiB logical output per call |
-| Key distributions | Power law alpha=1.15 and uniform alpha=0, reported separately |
+| Key distribution | Power law alpha=1.15 only |
 | Warmup | At least 2 seconds and 100 calls per caller before each measured phase |
 | Throughput phase | 10 seconds, all callers share a start and stop deadline |
 | Latency phase | 10 seconds, all callers share a start and stop deadline |
@@ -21,10 +21,11 @@ PyTorch is part of the container environment, not the measured execution path.
 
 16 GiB exceeds 8 GiB and is checked against the aggregate L3 capacity reported
 by sysfs when that information is available. A larger allocation alone does not
-prevent the hot rows of a skewed distribution from fitting in cache. The uniform
-control distributes requests over the table, reducing that concentration; it
-does not guarantee a cache miss for every key. Neither test measures physical
-DRAM bandwidth. No cache flush is performed between calls.
+prevent the hot rows of a skewed distribution from fitting in cache. This suite
+preserves the requested power law with alpha=1.15. Any further cache-working-set
+experiment needs a separate table/workload sizing decision; no additional key
+distribution is included. This test does not measure physical DRAM bandwidth.
+No cache flush is performed between calls.
 
 Key generation, table initialization, correctness checks, CSV writes and THP
 observations are outside the measured intervals. A fresh key ring is generated
@@ -144,12 +145,12 @@ results, copied CPU masks, sudo or a Docker daemon inside the container.
 # Inspect the ten CPU/NUMA configurations without allocating the large table.
 python3 benchmarks/host_layer/scaled.py --plan-only
 
-# 10 configurations x 2 distributions x 5 repeats = 100 measured runs.
-python3 benchmarks/host_layer/scaled.py --seconds 10 --repeats 5
+# 10 configurations x 5 repeats = 50 power-law runs.
+python3 benchmarks/host_layer/scaled.py --seconds 10 --repeats 5 --distributions powerlaw
 ```
 
-The measured phases total at least 2,000 seconds (33 minutes 20 seconds).
-Warmup adds at least 400 seconds. Building, table initialization, key generation
+The measured phases total at least 1,000 seconds (16 minutes 40 seconds).
+Warmup adds at least 200 seconds. Building, table initialization, key generation
 and other checks take additional time. All cases run sequentially; the runner
 does not launch multiple competing benchmark processes.
 
@@ -173,6 +174,9 @@ The report command can also show completed runs from an interrupted suite;
 check its status and run counts before treating it as a complete comparison.
 Pass a printed results directory instead of `latest` to select a specific run.
 Smoke and plan-only invocations do not replace the latest-full-run pointer.
+The report includes only power-law results. When reading an older mixed-workload
+directory, non-power-law rows are excluded and the completion count refers only
+to power-law runs. Original CSVs are retained.
 Files under `/tmp` are ephemeral. When export is unavailable, paste the compact
 report into the conversation before releasing the allocation.
 
@@ -180,3 +184,18 @@ Host THP settings are recorded and left unchanged. Native timed runs read
 process-wide `AnonHugePages` after each measured phase, while buffers are still
 alive and all callers are outside timing. These are two snapshots, not continuous
 monitoring or a table-specific attribution. No THP=always experiment is required.
+
+## Already running the earlier version
+
+The earlier `0d061ca` runner incorrectly defaulted to an additional uniform
+workload. Stop it with Ctrl+C, then run the following on the existing checkout:
+
+```bash
+python3 benchmarks/host_layer/scaled.py --seconds 10 --repeats 5 --distributions powerlaw
+```
+
+No fetch or rebuild is required for this correction on `0d061ca`. The command
+creates a new directory with 50 power-law runs. Completed power-law measurements
+in the interrupted directory remain usable; uniform measurements are excluded
+from this comparison. This changes neither the 16 GiB shared table nor the
+request size, alpha, caller counts, worker counts, timing or affinity settings.
