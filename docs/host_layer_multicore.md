@@ -1,5 +1,8 @@
 # Socket and whole-server HostLayer benchmark
 
+For the newer 16 GiB shared-table suite with 10-second phases and explicit
+per-thread CPU pinning, see [the large-table comparison](host_layer_scaled.md).
+
 Run from the repository root inside the existing development container. No
 Docker daemon or file transfer into the container is needed. Use the same
 container release and source revision on all servers.

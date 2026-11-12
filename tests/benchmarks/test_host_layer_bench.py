@@ -18,6 +18,7 @@
 """Integration tests against the actual built NVE benchmark; no mock kernel."""
 import csv
 import math
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -70,16 +71,51 @@ def exercise_benchmark(binary):
         # Edge sizes, uniform/strongly skewed workloads and a single-row table.
         run(['-nr', '1', '-ed', '1', '-b', '1', '--hotness', '1', '-ns', '4', '-nw', '0', '-a', '2'])
         run([*base, '-a', '-1', '--latency_keys', 'replay'])
+        # Timed phases must use actual completed calls, bounded key storage, and
+        # a common deadline even when many more calls finish than --num_steps.
+        allowed = sorted(os.sched_getaffinity(0))
+        caller_cpus = allowed[:min(2, len(allowed))]
+        for inline in (False, True):
+            timed = Path(tmp) / f'timed-{inline}.csv'
+            run([*base, '-t', str(len(caller_cpus)), '-nw', '1',
+                 '--throughput_seconds', '0.05', '--latency_seconds', '0.05',
+                 '--warmup_seconds', '0.01', '--key_buffer_steps', '2',
+                 '--caller_cpus', ','.join(map(str, caller_cpus)),
+                 '--threadpool_workers', str(len(caller_cpus)),
+                 '--task_size_threshold', '32', '-csv', str(timed),
+                 *(['--disable_threadpool'] if inline else
+                   ['--worker_cpus', ','.join(map(str, caller_cpus))])])
+            with timed.open() as f:
+                r = next(csv.DictReader(f))
+            assert r['timing_mode'] == 'duration'
+            assert float(r['inference_time_s']) >= .05
+            assert float(r['latency_time_s']) >= .05
+            assert int(r['key_bytes_per_caller']) == 2 * 3 * 65 * 8
+            calls = int(r['throughput_completed_calls'])
+            assert calls >= len(caller_cpus)
+            assert int(r['lat_steps']) >= len(caller_cpus)
+            assert int(r['host_hitrate_samples']) == calls
+            assert math.isclose(float(r['mkps']), calls * 195 / float(r['inference_time_s']) / 1e6, rel_tol=1e-9)
+            assert r['caller_cpus'] == ','.join(map(str, caller_cpus))
+            assert float(r['lat_p99_ms']) <= float(r['lat_max_ms'])
+        # Reject a sample cap overflow instead of reallocating or truncating a tail.
+        run([*base, '-nw', '0', '--throughput_seconds', '.05', '--latency_seconds', '.05',
+             '--key_buffer_steps', '1', '--latency_sample_limit', '1',
+             '--disable_threadpool', '--hitrate_interval', '0'], ok=False)
         for args in [['-nr', '0'], ['-b', '-1'], ['--latency_steps', '-2'],
                      ['--threadpool_workers', '-1'], ['--alpha', 'nan'], ['--alpha', 'inf'],
                      ['--latency_keys', 'invalid'], ['-dt', 'invalid'], ['-ns', '0'],
                      ['--task_size_threshold', '0'], ['--hitrate_interval', '-1'],
                      ['-ed', '9223372036854775807'], ['--alpha', '1000000'],
-                     ['--device', 'cuda'], ['--layer', 'hierarchical']]:
+                     ['--device', 'cuda'], ['--layer', 'hierarchical'],
+                     ['--throughput_seconds', '1'], ['--warmup_seconds', '1'],
+                     ['--throughput_seconds', 'nan'], ['--key_buffer_steps', '0'],
+                     ['--latency_sample_limit', '0'], ['--caller_cpus', '0,0'],
+                     ['--caller_cpus', '0,'], ['--worker_cpus', '0', '--disable_threadpool']]:
             run(args, ok=False)
         path.write_text('different,header\n')
         run([*base, '-csv', str(path)], ok=False)
-    print('PASS: real NVE gather/default rows/final outputs; fp32/fp16; inline/pool; concurrent layers; metrics/CSV; invalid arguments')
+    print('PASS: real NVE gather/default rows/final outputs; fp32/fp16; inline/pool; concurrent layers; timed phases/bounded keys/CPU affinity; metrics/CSV; invalid arguments')
 
 def test_host_layer_benchmark():
     import os
